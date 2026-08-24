@@ -391,7 +391,7 @@ CURRENT INSTRUCTION:
     })
 
     stream = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-20b",
         messages=messages,
         temperature=0.2,
         stream=True
