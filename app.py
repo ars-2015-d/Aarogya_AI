@@ -1,4 +1,5 @@
 import os
+import gc
 import faiss
 import numpy as np
 import pandas as pd
@@ -6,7 +7,7 @@ import requests
 import streamlit as st
 import bm25s
 
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from groq import Groq
 from huggingface_hub import hf_hub_download, snapshot_download
@@ -25,11 +26,11 @@ st.set_page_config(
     page_title="AarogyaAI • Medical Assistant",
     page_icon="🩺",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 # ============================================================
-# CLEAN CLAUDE-STYLE DARK THEME
+# CLEAN CLAUDE-STYLE DARK THEME (SAFE FOR STREAMLIT ICONS)
 # ============================================================
 st.markdown("""
 <link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
@@ -46,8 +47,9 @@ st.markdown("""
         --accent-terracotta: #D97757;
     }
 
-    * {
-        font-family: 'Inter', -apple-system, sans-serif !important;
+    /* Scoped font application to avoid breaking Streamlit internal Material Icons */
+    .stApp, p, span, div, h1, h2, h3, button, input, textarea {
+        font-family: 'Inter', -apple-system, sans-serif;
     }
 
     html, body, .stApp, [data-testid="stAppViewContainer"] {
@@ -61,7 +63,7 @@ st.markdown("""
 
     .main .block-container {
         max-width: 800px !important;
-        padding-top: 3rem !important;
+        padding-top: 2rem !important;
         padding-bottom: 8.5rem !important;
         margin: 0 auto !important;
     }
@@ -69,26 +71,26 @@ st.markdown("""
     /* Welcome Greeting */
     .claude-greeting {
         font-family: 'Newsreader', Georgia, serif !important;
-        font-size: 2.6rem;
+        font-size: 2.3rem;
         font-weight: 400;
         color: var(--text-headline);
         text-align: center;
         letter-spacing: -0.02em;
-        margin: 3.5rem 0 0.5rem 0;
+        margin: 2rem 0 0.5rem 0;
         display: flex;
         align-items: center;
         justify-content: center;
-        gap: 0.75rem;
+        gap: 0.6rem;
     }
     .claude-sparkle {
         color: var(--accent-terracotta);
-        font-size: 2rem;
+        font-size: 1.8rem;
     }
     .claude-subheading {
         text-align: center;
         color: var(--text-muted);
-        font-size: 0.95rem;
-        margin-bottom: 2.5rem;
+        font-size: 0.9rem;
+        margin-bottom: 2rem;
     }
 
     /* Left Sidebar */
@@ -116,7 +118,7 @@ st.markdown("""
     .stChatMessage {
         border-radius: 12px !important;
         padding: 1rem 1.25rem !important;
-        font-size: 0.96rem !important;
+        font-size: 0.95rem !important;
         line-height: 1.7 !important;
         margin-bottom: 1rem !important;
         border: none !important;
@@ -136,7 +138,7 @@ st.markdown("""
         padding-left: 0.5rem !important;
     }
 
-    /* Quick Action Pill Buttons */
+    /* Action Pill Buttons */
     .stButton > button {
         background: var(--surface-card) !important;
         color: var(--text-body) !important;
@@ -190,8 +192,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+
 # ============================================================
-# LOAD RAG BACKEND
+# LOAD RAG BACKEND (MEMORY OPTIMIZED)
 # ============================================================
 @st.cache_resource
 def load_rag_backend():
@@ -208,13 +211,14 @@ def load_rag_backend():
         token=HF_TOKEN
     )
 
-    exploded_df = pd.read_parquet(parquet_path)
+    # Load only the text column into a lightweight Series to save ~200MB RAM
+    chunk_series = pd.read_parquet(parquet_path, columns=["chunk_text"])["chunk_text"]
     index = faiss.read_index(faiss_path)
 
     try:
         embedding = HuggingFaceEmbeddings(
             model_name="BAAI/bge-base-en-v1.5",
-            model_kwargs={"device": "mps"}
+            model_kwargs={"device": "cpu"}
         )
     except Exception:
         embedding = HuggingFaceEmbeddings(model_name="BAAI/bge-base-en-v1.5")
@@ -229,17 +233,19 @@ def load_rag_backend():
         saved_path = os.path.join(bm25_dir, "bm25_index_saved")
         bm25_index = bm25s.BM25.load(saved_path, load_corpus=False)
     except Exception:
-        corpus = exploded_df["chunk_text"].tolist()
+        corpus = chunk_series.tolist()
         corpus_tokens = bm25s.tokenize(corpus, show_progress=False)
         bm25_index = bm25s.BM25()
         bm25_index.index(corpus_tokens)
 
+    gc.collect()  # Flush intermediate objects from RAM
     client = Groq(api_key=GROQ_API_KEY)
-    return exploded_df, index, embedding, bm25_index, client
+    return chunk_series, index, embedding, bm25_index, client
 
 
 with st.spinner("Connecting knowledge base..."):
-    exploded_df, faiss_index, embedding_model, bm25_index, groq_client = load_rag_backend()
+    chunk_series, faiss_index, embedding_model, bm25_index, groq_client = load_rag_backend()
+
 
 # ============================================================
 # LOCATION & HOSPITALS
@@ -280,6 +286,7 @@ def get_location_and_hospitals():
 
 user_city, user_lat, user_lon, nearby_hospitals = get_location_and_hospitals()
 
+
 # ============================================================
 # RETRIEVAL & TRIAGE
 # ============================================================
@@ -300,7 +307,7 @@ def hybrid_search(query, top_k=3):
         rrf_scores[idx] = rrf_scores.get(idx, 0) + 1 / (60 + rank + 1)
 
     top_indices = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-    return exploded_df.iloc[[idx for idx, _ in top_indices]]
+    return [chunk_series.iloc[idx] for idx, _ in top_indices]
 
 
 def build_retrieval_query(query, history):
@@ -330,44 +337,43 @@ def stream_response(query, history, hospitals, context):
     clean_query = query.strip().lower()
 
     if clean_query in {"thank you", "thanks", "thx", "ok", "okay", "bye", "goodbye", "got it", "great", "alright"}:
-        yield "You're very welcome! Rest well, keep hydrated, and don't hesitate to reach back out if anything changes. Take good care of yourself! 🙏"
+        yield "You're very welcome! Rest well, keep hydrated, and feel free to reach out if anything changes. Take good care! 🙏"
         return
 
     if is_emergency(query):
         hospital_str = f"**{hospitals[0]}**" if hospitals else "your nearest emergency room"
         yield (
             f"🚨 **Please seek emergency medical care right away.**\n\n"
-            f"I hear how uncomfortable this is, but the symptoms you described need immediate hands-on clinical evaluation. "
-            f"Please have someone take you to {hospital_str} or call local emergency services immediately. Do not wait."
+            f"The symptoms you described need immediate clinical evaluation. "
+            f"Please head to {hospital_str} or call your local emergency services right away."
         )
         return
 
     user_turns = len([m for m in history if m["role"] == "user"])
     hospital_name = f"**{hospitals[0]}**" if hospitals else "your nearest clinic"
 
-    # Assess if the query is straightforward or complex
-    is_simple_query = len(query.split()) > 8 or any(kw in clean_query for kw in ["since", "after", "fever", "throat", "headache", "pain in", "feeling"])
+    is_simple_query = len(query.split()) > 7 or any(kw in clean_query for kw in ["since", "after", "fever", "throat", "headache", "pain in", "exhausted", "tired"])
 
     if is_simple_query or user_turns >= 1:
         directive = f"""Provide direct, clear, and reassuring medical guidance right away.
-- Organize your response cleanly:
-  1. **What might be going on**: 2-3 friendly, common possibilities in simple words.
-  2. **Practical Home Care**: 3 safe and easy relief tips (hydration, rest, gentle remedies).
-  3. **When to get checked in person**: Red flags to monitor.
+- Structure clearly:
+  1. **What might be going on**: 2-3 friendly, common possibilities.
+  2. **Practical Home Care**: 3 safe, easy relief steps.
+  3. **When to get checked in person**: Red flags to watch for.
   4. **Next Steps**: A warm reminder to visit {hospital_name} or see a doctor in person if it worsens or persists.
 - Do NOT ask more follow-up questions."""
     else:
         directive = """The user's query is brief or ambiguous. 
 - Acknowledge their concern with warmth and reassurance.
-- Answer what you can directly, and ask ONLY ONE friendly, natural follow-up question (such as when it started or if they notice other symptoms).
-- NEVER ask the user to rate pain on a scale of 1 to 10."""
+- Answer what you can directly, and ask ONLY ONE friendly, natural follow-up question (such as when it started or if other symptoms are present).
+- NEVER ask to rate pain on a scale of 1 to 10."""
 
     system_message = f"""You are AarogyaAI, a friendly, compassionate, and knowledgeable doctor assistant.
 
 PERSONA & RULES:
-- Speak warmly and empathetically, like an approachable, caring physician.
+- Speak warmly and empathetically, like an approachable physician.
 - Be direct: answer simple questions quickly without unnecessary friction.
-- If more details are truly needed, ask ONLY ONE focused, conversational question.
+- If more details are needed, ask ONLY ONE focused, natural question.
 - STRICT BAN: Never say "on a scale of 1 to 10" or "rate your pain".
 - Never offer definitive diagnoses or replace in-person medical evaluation.
 
@@ -385,7 +391,7 @@ CURRENT INSTRUCTION:
     })
 
     stream = groq_client.chat.completions.create(
-        model="openai/gpt-oss-20b",
+        model="llama-3.3-70b-versatile",
         messages=messages,
         temperature=0.2,
         stream=True
@@ -444,8 +450,18 @@ with st.sidebar:
 # MAIN CANVAS (GREETING & QUICK START)
 # ============================================================
 if not st.session_state.messages:
-    hour = datetime.now().hour
-    time_greeting = "Good evening" if hour >= 18 else ("Good morning" if hour < 12 else "Good afternoon")
+    # Accurate IST Timezone Calculation (UTC + 5:30)
+    ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    hour = ist_now.hour
+
+    if hour < 4 or hour >= 22:
+        time_greeting = "Up late"
+    elif hour < 12:
+        time_greeting = "Good morning"
+    elif hour < 17:
+        time_greeting = "Good afternoon"
+    else:
+        time_greeting = "Good evening"
 
     st.markdown(f"""
     <div class="claude-greeting">
@@ -475,7 +491,7 @@ if not st.session_state.messages:
     if quick_input:
         retrieval_query = build_retrieval_query(quick_input, [])
         results = hybrid_search(retrieval_query, top_k=3)
-        context = "\n\n".join([f"[REFERENCE CASE {i+1}]\n{c}" for i, c in enumerate(results["chunk_text"].tolist())])
+        context = "\n\n".join([f"[REFERENCE CASE {i+1}]\n{c}" for i, c in enumerate(results)])
 
         st.session_state.messages.append({"role": "user", "content": quick_input})
         with st.chat_message("user", avatar="👤"):
@@ -501,7 +517,7 @@ for msg in st.session_state.messages:
 if user_text := st.chat_input("Describe how you are feeling or ask a question..."):
     retrieval_query = build_retrieval_query(user_text, st.session_state.messages)
     results = hybrid_search(retrieval_query, top_k=3)
-    context = "\n\n".join([f"[REFERENCE CASE {i+1}]\n{c}" for i, c in enumerate(results["chunk_text"].tolist())])
+    context = "\n\n".join([f"[REFERENCE CASE {i+1}]\n{c}" for i, c in enumerate(results)])
 
     st.session_state.messages.append({"role": "user", "content": user_text})
     with st.chat_message("user", avatar="👤"):
