@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+faiss-cpu
+bm25s
+huggingface_hub
+langchain-huggingface
+sentence-transformers
+groq
+python-dotenv
+requests
+pyarrow
