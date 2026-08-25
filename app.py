@@ -304,7 +304,7 @@ user_city, user_lat, user_lon, nearby_hospitals = get_location_and_hospitals()
 
 
 # ============================================================
-# RETRIEVAL & QUERY CLASSIFIER
+# RETRIEVAL & CLASSIFICATION
 # ============================================================
 def hybrid_search(query, top_k=3):
     query_vector = np.array(
@@ -338,78 +338,116 @@ EMERGENCY_KEYWORDS = [
     "chest pain", "heart attack", "can't breathe", "cannot breathe",
     "difficulty breathing", "shortness of breath", "fainting", "passed out",
     "sudden numbness", "slurred speech", "stroke", "severe bleeding",
-    "coughing blood", "unconscious", "severe chest"
+    "coughing blood", "unconscious", "severe chest", "chest tight",
+    "chest feels heavy", "heavy and tight", "arm numb", "left arm",
+    "radiating pain", "crushing pressure"
 ]
-
 
 def is_emergency(query):
     q = query.lower()
-    return any(kw in q for kw in EMERGENCY_KEYWORDS)
+    if any(kw in q for kw in EMERGENCY_KEYWORDS):
+        return True
+    if "chest" in q and any(w in q for w in ["tight", "heavy", "pain", "pressure", "burning"]):
+        return True
+    if "arm" in q and any(w in q for w in ["numb", "tingling", "weak", "heavy"]):
+        return True
+    return False
+
+
+MEDICATION_KEYWORDS = [
+    "tablet", "tablets", "medicine", "medication", "drug", "pill", "pills",
+    "dose", "dosage", "otc", "over the counter", "syrup", "capsule", "antibiotic"
+]
+
+HOME_REMEDY_KEYWORDS = [
+    "try at home", "at home", "home remedy", "home remedies", "home care",
+    "what should i do at home", "natural remedy"
+]
+
+SYMPTOM_PHRASES = [
+    "i have", "i've been", "i am feeling", "i'm feeling", "i feel",
+    "my ", "since yesterday", "since last", "for the past", "it hurts",
+    "he is", "she is", "they are", "feeling sick", "not well", "unwell"
+]
+
+
+def classify_query(query):
+    q = query.lower()
+    if any(kw in q for kw in HOME_REMEDY_KEYWORDS):
+        return "home_remedy"
+    if any(kw in q for kw in MEDICATION_KEYWORDS):
+        return "medication"
+    if any(phrase in q for phrase in SYMPTOM_PHRASES):
+        return "symptom"
+    return "informational"
 
 
 # ============================================================
-# STREAMING ENGINE WITH DIRECT INTENT ROUTING
+# STREAMING ENGINE
 # ============================================================
-# ============================================================
-# STREAMING ENGINE (CRISP, CONCISE & INTENT-DRIVEN)
-# ============================================================
-# ============================================================
-# STREAMING ENGINE (BALANCED & COMPLETE)
-# ============================================================
-# ============================================================
-# STREAMING ENGINE (NATURAL, INTENT-AWARE CONVERSATIONAL AI)
-# ============================================================
-def stream_response(query, history, hospitals, context):
+def stream_response(query, history, hospitals, context, is_followup_reply=False):
     clean_query = query.strip().lower()
 
-    # 1. Quick polite exits
-    if clean_query in {"thank you", "thanks", "thx", "ok", "okay", "bye", "goodbye", "got it", "great", "alright"}:
+    if clean_query in {"thank you", "thanks", "thx", "ok", "okay", "bye", "goodbye", "got it", "great", "alright", "ok thank you"}:
         yield "You're very welcome! Rest well, stay hydrated, and feel free to reach out if anything changes. Take good care! 🙏"
         return
 
-    # 2. Hard emergency trigger
+    # IMMEDIATE EMERGENCY OVERRIDE
     if is_emergency(query):
         hospital_str = f"**{hospitals[0]}**" if hospitals else "your nearest emergency department"
         yield (
             f"🚨 **EMERGENCY WARNING: Please seek immediate emergency medical care.**\n\n"
-            f"Symptoms such as chest tightness, crushing pressure, or radiating arm numbness require urgent clinical evaluation.\n\n"
-            f"• **Do not wait or try home remedies.**\n"
-            f"• Go immediately to {hospital_str} or call emergency services (112 / 108 / 911)."
+            f"Symptoms involving chest tightness, pressure, or radiating arm numbness can indicate a serious cardiovascular or acute medical emergency.\n\n"
+            f"• **Do not wait and do not attempt home care.**\n"
+            f"• Go immediately to {hospital_str} or call emergency services (112 / 108 / 911) right now."
         )
         return
 
     hospital_name = f"**{hospitals[0]}**" if hospitals else "your nearest clinic"
+    query_type = classify_query(query)
 
-    system_message = f"""You are AarogyaAI, an intelligent clinical triage and health assistant modeled after natural conversational AI like ChatGPT and Gemini.
+    if query_type == "medication":
+        directive = """The user is asking about a tablet, medicine, or OTC drug.
+- State in 1-2 concise bullet points what that class of medicine is generally used for.
+- NEVER state specific milligram (mg) dosages, frequencies, or prescription regimens.
+- MANDATORY final warning: "⚠️ *Do not take any medication without consulting a doctor or pharmacist to confirm the appropriate choice and dosage for your health condition.*"
+- Maximum 4 sentences total."""
 
-CRITICAL INSTRUCTIONS ON WHEN TO ANSWER VS. WHEN TO ASK FOLLOW-UPS:
+    elif query_type == "home_remedy":
+        directive = f"""The user explicitly asked for home care steps.
+- Provide 3 practical, safe home comfort steps in clear bullet points.
+- NEVER use markdown tables.
+- Add one closing line: "If symptoms persist or worsen after 24–48 hours, please consult a healthcare provider at {hospital_name}."
+- No lengthy explanations or follow-up questions."""
 
-1. DETAILED / SPECIFIC QUESTIONS (e.g. user provides duration, symptoms, or asks a direct home remedy / explanation question):
-   - Provide a DIRECT, complete, and helpful answer immediately.
-   - DO NOT ask follow-up questions if the user has already provided sufficient context or asked for specific advice.
-   - Structure clearly: explain what may be occurring and provide 2-3 safe, practical home care steps.
-   - Add a brief note on when to see a doctor at {hospital_name} if symptoms persist or worsen.
+    elif query_type == "symptom" and not is_followup_reply:
+        directive = """The user is reporting a symptom for the first time without sufficient detail.
+- Warmly acknowledge their discomfort in 1 short sentence.
+- Ask EXACTLY 2 natural, focused follow-up questions (e.g., onset/duration, exact location, or accompanying fever/nausea).
+- NEVER ask to rate pain on a scale of 1 to 10.
+- Do NOT provide long lists of home remedies or red-flag dumps yet — wait for their reply."""
 
-2. SHORT / VAGUE / INSUFFICIENT QUERIES (e.g. "My back hurts", "I have a headache", "I feel sick", "my stomach aches"):
-   - When key clinical context is missing (location, duration, severity), do NOT guess blindly.
-   - Acknowledge their discomfort with warmth and empathy in 1 sentence.
-   - Ask 2 focused, natural follow-up questions to understand the situation (e.g., onset, pain location, associated fever/nausea).
-   - Keep it brief so the user can reply.
+    else:
+        if query_type == "symptom":
+            directive = f"""The user has answered your follow-up questions.
+- Briefly mention what type of condition this pattern is commonly associated with (phrased as a possibility, never a definitive diagnosis).
+- Give 3 concise, safe home comfort steps in bullet points (NO markdown tables).
+- Highlight 1-2 red-flag signs that require visiting {hospital_name} or a physician.
+- Do not ask further follow-up questions."""
+        else:
+            directive = """This is a general factual question.
+- Answer directly and concisely in 2-3 short paragraphs or bullet points.
+- Do NOT use the triage or home-care template."""
 
-3. TABLETS & MEDICATIONS:
-   - State the generic Over-The-Counter (OTC) class and its intended clinical purpose in India (e.g., Paracetamol for fever/mild pain, Antacids/PPIs for acidity).
-   - STRICT SAFETY RULE: NEVER prescribe specific milligram (mg) dosages, frequencies, or antibiotic courses.
-   - Always include: "⚠️ *Please consult a doctor or pharmacist to confirm the appropriate medication and dosage for your health condition.*"
-   - Keep the answer concise and direct.
+    system_message = f"""You are AarogyaAI, an empathetic clinical triage and health assistant.
 
-4. CHILDREN / PEDIATRIC CASES:
-   - Emphasize that symptoms in children require extra caution and a pediatrician's guidance.
-   - If vague, ask 2 gentle questions about the child (fever level, energy/hydration). If details are provided, give safe supportive care tips and red flags.
+CRITICAL FORMATTING & SAFETY RULES:
+- NEVER generate markdown tables. Use standard markdown bullet points only.
+- Refuse to prescribe specific antibiotic or prescription drug dosages (mg amounts).
+- Keep every answer structured, concise, and easy to read.
 
-GENERAL FORMATTING RULES:
-- Sound conversational, intelligent, and natural.
-- Avoid rigid, repetitive checklists or huge text walls.
-- Never ask users to "rate pain on a scale of 1 to 10".
+CURRENT INSTRUCTION:
+{directive}
 """
 
     messages = [{"role": "system", "content": system_message}]
@@ -424,8 +462,8 @@ GENERAL FORMATTING RULES:
     stream = groq_client.chat.completions.create(
         model="openai/gpt-oss-20b",
         messages=messages,
-        temperature=0.2,
-        max_tokens=500,
+        temperature=0.1,
+        max_tokens=550,
         stream=True
     )
 
@@ -433,11 +471,15 @@ GENERAL FORMATTING RULES:
         content = chunk.choices[0].delta.content
         if content:
             yield content
+
+
 # ============================================================
 # SESSION STATE
 # ============================================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "awaiting_followup_reply" not in st.session_state:
+    st.session_state.awaiting_followup_reply = False
 
 # ============================================================
 # SIDEBAR
@@ -447,6 +489,7 @@ with st.sidebar:
 
     if st.button("＋  New Consultation", use_container_width=True):
         st.session_state.messages = []
+        st.session_state.awaiting_followup_reply = False
         st.rerun()
 
     st.markdown('<div class="sidebar-section-title">Session History</div>', unsafe_allow_html=True)
@@ -521,14 +564,17 @@ if not st.session_state.messages:
         retrieval_query = build_retrieval_query(quick_input, [])
         results = hybrid_search(retrieval_query, top_k=3)
         context = "\n\n".join([f"[REFERENCE CASE {i+1}]\n{c}" for i, c in enumerate(results)])
+        is_followup_reply = st.session_state.awaiting_followup_reply
+        query_type = classify_query(quick_input)
 
         st.session_state.messages.append({"role": "user", "content": quick_input})
         with st.chat_message("user", avatar="👤"):
             st.markdown(quick_input)
 
         with st.chat_message("assistant", avatar="🩺"):
-            reply = st.write_stream(stream_response(quick_input, [], nearby_hospitals, context))
+            reply = st.write_stream(stream_response(quick_input, [], nearby_hospitals, context, is_followup_reply))
 
+        st.session_state.awaiting_followup_reply = (query_type == "symptom" and not is_followup_reply)
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
 
@@ -549,12 +595,15 @@ if user_text := st.chat_input("Describe how you are feeling or ask a question...
     context = "\n\n".join([f"[REFERENCE CASE {i+1}]\n{c}" for i, c in enumerate(results)])
 
     history = st.session_state.messages[:]
+    is_followup_reply = st.session_state.awaiting_followup_reply
+    query_type = classify_query(user_text)
 
     st.session_state.messages.append({"role": "user", "content": user_text})
     with st.chat_message("user", avatar="👤"):
         st.markdown(user_text)
 
     with st.chat_message("assistant", avatar="🩺"):
-        reply = st.write_stream(stream_response(user_text, history, nearby_hospitals, context))
+        reply = st.write_stream(stream_response(user_text, history, nearby_hospitals, context, is_followup_reply))
 
+    st.session_state.awaiting_followup_reply = (query_type == "symptom" and not is_followup_reply)
     st.session_state.messages.append({"role": "assistant", "content": reply})
