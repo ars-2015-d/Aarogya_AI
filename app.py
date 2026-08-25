@@ -18,8 +18,20 @@ from langchain_huggingface import HuggingFaceEmbeddings
 # ============================================================
 load_dotenv()
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "gsk_01aJWsQwyJpqIoGCEbFyWGdyb3FYFrqMvn")
-HF_TOKEN = os.environ.get("HF_TOKEN", "hf_QMvJCnNSbxQrEkkRLIRA")
+# SECURITY FIX: no hardcoded fallback keys. Fail loudly instead of
+# silently running on an embedded secret (which is what was happening
+# before — those two keys must be rotated now that they've been pasted
+# into a chat, regardless of this fix).
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
+HF_TOKEN = os.environ.get("HF_TOKEN") or st.secrets.get("HF_TOKEN", None)
+
+if not GROQ_API_KEY or not HF_TOKEN:
+    st.error(
+        "Missing GROQ_API_KEY or HF_TOKEN. Set them in Streamlit Cloud → "
+        "App settings → Secrets (as TOML: GROQ_API_KEY = \"...\"), not in code."
+    )
+    st.stop()
+
 REPO_ID = "Hybridminded/aarogya-data"
 
 st.set_page_config(
@@ -47,7 +59,16 @@ st.markdown("""
         --accent-terracotta: #D97757;
     }
 
-    /* Scoped font application to avoid breaking Streamlit internal Material Icons */
+    /* Force a consistent color-scheme so native browser/OS light-mode
+       rendering of form controls (textarea caret, autofill, etc.)
+       doesn't fight our overrides. This is the root cause of "white
+       text on white background" in the chat input under light mode:
+       Streamlit's own light theme was winning inside the BaseWeb
+       textarea before our color rule applied on top of it. */
+    html, body {
+        color-scheme: dark;
+    }
+
     .stApp, p, span, div, h1, h2, h3, button, input, textarea {
         font-family: 'Inter', -apple-system, sans-serif;
     }
@@ -68,7 +89,6 @@ st.markdown("""
         margin: 0 auto !important;
     }
 
-    /* Welcome Greeting */
     .claude-greeting {
         font-family: 'Newsreader', Georgia, serif !important;
         font-size: 2.3rem;
@@ -93,7 +113,6 @@ st.markdown("""
         margin-bottom: 2rem;
     }
 
-    /* Left Sidebar */
     [data-testid="stSidebar"] {
         background: var(--sidebar-bg) !important;
         border-right: 1px solid var(--border-color) !important;
@@ -114,7 +133,6 @@ st.markdown("""
         margin: 1.5rem 0 0.5rem 0;
     }
 
-    /* Chat Messages */
     .stChatMessage {
         border-radius: 12px !important;
         padding: 1rem 1.25rem !important;
@@ -127,18 +145,15 @@ st.markdown("""
         color: var(--text-headline) !important;
     }
 
-    /* User Message Bubble */
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) {
         background: var(--surface-card) !important;
         border: 1px solid var(--border-color) !important;
     }
-    /* Assistant Message Canvas */
     [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) {
         background: transparent !important;
         padding-left: 0.5rem !important;
     }
 
-    /* Action Pill Buttons */
     .stButton > button {
         background: var(--surface-card) !important;
         color: var(--text-body) !important;
@@ -157,8 +172,15 @@ st.markdown("""
         transform: translateY(-1px);
     }
 
-    /* Chat Input */
-    [data-testid="stChatInput"] {
+    /* --- CHAT INPUT: fixed for light-mode visibility ---
+       Target every layer (container, BaseWeb wrapper, and the raw
+       textarea) explicitly with background + text color together,
+       so no layer can independently fall back to a native light
+       background under a light OS/browser theme. */
+    [data-testid="stChatInput"],
+    [data-testid="stChatInput"] > div,
+    [data-testid="stChatInput"] [data-baseweb="textarea"],
+    [data-testid="stChatInput"] [data-baseweb="base-input"] {
         background: var(--surface-card) !important;
         border: 1px solid var(--border-color) !important;
         border-radius: 16px !important;
@@ -168,14 +190,20 @@ st.markdown("""
         border-color: var(--accent-terracotta) !important;
     }
     [data-testid="stChatInput"] textarea {
+        background: transparent !important;
         color: var(--text-headline) !important;
+        -webkit-text-fill-color: var(--text-headline) !important;
+        caret-color: var(--text-headline) !important;
         font-size: 0.95rem !important;
+    }
+    [data-testid="stChatInput"] textarea::placeholder {
+        color: var(--text-muted) !important;
+        opacity: 1 !important;
     }
     [data-testid="stBottomBlockContainer"] {
         background: transparent !important;
     }
 
-    /* Urgent Box */
     .emergency-box {
         background: #2C1818;
         border: 1px solid #572A2A;
@@ -211,7 +239,6 @@ def load_rag_backend():
         token=HF_TOKEN
     )
 
-    # Load only the text column into a lightweight Series to save ~200MB RAM
     chunk_series = pd.read_parquet(parquet_path, columns=["chunk_text"])["chunk_text"]
     index = faiss.read_index(faiss_path)
 
@@ -238,7 +265,7 @@ def load_rag_backend():
         bm25_index = bm25s.BM25()
         bm25_index.index(corpus_tokens)
 
-    gc.collect()  # Flush intermediate objects from RAM
+    gc.collect()
     client = Groq(api_key=GROQ_API_KEY)
     return chunk_series, index, embedding, bm25_index, client
 
@@ -288,16 +315,16 @@ user_city, user_lat, user_lon, nearby_hospitals = get_location_and_hospitals()
 
 
 # ============================================================
-# RETRIEVAL & TRIAGE
+# RETRIEVAL
 # ============================================================
-def hybrid_search(query, top_k=3):
+def hybrid_search(query, top_k=3, return_scores=False):
     query_vector = np.array(
         embedding_model.embed_query(query), dtype="float32"
     ).reshape(1, -1)
-    _, vec_indices = faiss_index.search(query_vector, 8)
+    vec_scores, vec_indices = faiss_index.search(query_vector, 8)
 
     query_tokens = bm25s.tokenize(query, show_progress=False)
-    bm25_results, _ = bm25_index.retrieve(query_tokens, k=8)
+    bm25_results, bm25_scores = bm25_index.retrieve(query_tokens, k=8)
     bm25_indices = bm25_results[0]
 
     rrf_scores = {}
@@ -306,8 +333,17 @@ def hybrid_search(query, top_k=3):
     for rank, idx in enumerate(vec_indices[0]):
         rrf_scores[idx] = rrf_scores.get(idx, 0) + 1 / (60 + rank + 1)
 
-    top_indices = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-    return [chunk_series.iloc[idx] for idx, _ in top_indices]
+    ranked = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+    top = ranked[:top_k]
+    chunks = [chunk_series.iloc[idx] for idx, _ in top]
+
+    if return_scores:
+        # Top RRF score is a rough proxy for "did retrieval actually find
+        # something relevant" — used below to decide whether the model
+        # should hedge instead of answering confidently.
+        top_score = top[0][1] if top else 0.0
+        return chunks, top_score
+    return chunks
 
 
 def build_retrieval_query(query, history):
@@ -331,9 +367,26 @@ def is_emergency(query):
 
 
 # ============================================================
+# FOLLOW-UP DECISION (replaces the old keyword/word-count heuristic)
+# ============================================================
+def should_ask_followup(query, history, top_score):
+    if st.session_state.get("followup_used"):
+        return False
+    user_turns = len([m for m in history if m["role"] == "user"])
+    if user_turns > 0:
+        return False
+    if is_emergency(query):
+        return False
+    word_count = len(query.split())
+    is_vague = word_count <= 6
+    weak_retrieval = top_score < 0.02  # tuned loosely; adjust after logging real scores
+    return is_vague and weak_retrieval
+
+
+# ============================================================
 # STREAMING ENGINE
 # ============================================================
-def stream_response(query, history, hospitals, context):
+def stream_response(query, history, hospitals, context, ask_followup):
     clean_query = query.strip().lower()
 
     if clean_query in {"thank you", "thanks", "thx", "ok", "okay", "bye", "goodbye", "got it", "great", "alright"}:
@@ -349,33 +402,39 @@ def stream_response(query, history, hospitals, context):
         )
         return
 
-    user_turns = len([m for m in history if m["role"] == "user"])
     hospital_name = f"**{hospitals[0]}**" if hospitals else "your nearest clinic"
 
-    is_simple_query = len(query.split()) > 7 or any(kw in clean_query for kw in ["since", "after", "fever", "throat", "headache", "pain in", "exhausted", "tired"])
-
-    if is_simple_query or user_turns >= 1:
-        directive = f"""Provide direct, clear, and reassuring medical guidance right away.
-- Structure clearly:
-  1. **What might be going on**: 2-3 friendly, common possibilities.
-  2. **Practical Home Care**: 3 safe, easy relief steps.
-  3. **When to get checked in person**: Red flags to watch for.
-  4. **Next Steps**: A warm reminder to visit {hospital_name} or see a doctor in person if it worsens or persists.
-- Do NOT ask more follow-up questions."""
-    else:
-        directive = """The user's query is brief or ambiguous. 
+    if ask_followup:
+        directive = """The user's query is brief and retrieval did not find a strong match in the reference material.
 - Acknowledge their concern with warmth and reassurance.
-- Answer what you can directly, and ask ONLY ONE friendly, natural follow-up question (such as when it started or if other symptoms are present).
-- NEVER ask to rate pain on a scale of 1 to 10."""
+- Answer what you safely can from the reference context, if anything applies.
+- Ask ONLY ONE focused, natural follow-up question that would materially improve the answer (e.g. duration, severity, associated symptoms).
+- NEVER ask to rate pain on a scale of 1 to 10.
+- This is your only chance to ask a follow-up in this conversation — do not plan to ask another one later."""
+    else:
+        directive = f"""Provide direct, clear guidance now — do not ask further questions.
+- Structure clearly:
+  1. **What might be going on**: possibilities, phrased as possibilities ("can be associated with", not "you have").
+  2. **Practical Home Care**: safe, general steps — only if genuinely low-risk self-care applies to this topic.
+  3. **When to get checked in person**: concrete red flags.
+  4. **Next Steps**: a reminder to see {hospital_name} or a doctor if it worsens or persists.
+- If the reference context below does not actually address this question, say so plainly
+  ("I don't have solid reference material on this specific point") instead of filling the gap
+  from general knowledge presented with the same confidence as sourced content."""
 
-    system_message = f"""You are AarogyaAI, a friendly, compassionate, and knowledgeable doctor assistant.
+    system_message = f"""You are AarogyaAI, a friendly, compassionate medical-information assistant — not a diagnosing physician.
 
-PERSONA & RULES:
-- Speak warmly and empathetically, like an approachable physician.
-- Be direct: answer simple questions quickly without unnecessary friction.
-- If more details are needed, ask ONLY ONE focused, natural question.
-- STRICT BAN: Never say "on a scale of 1 to 10" or "rate your pain".
-- Never offer definitive diagnoses or replace in-person medical evaluation.
+GROUNDING RULES (accuracy-critical, follow strictly):
+- Base factual medical claims on the Reference Context provided below whenever it's relevant. Treat it as your primary source.
+- If the Reference Context does not cover the specific question (e.g. exact dosing, drug combinations, lab thresholds), do NOT invent numbers or specifics from general training knowledge and present them with the same confidence as sourced fact. Say plainly that this needs a clinician/pharmacist, and stop there.
+- NEVER state a specific drug dosage, mg amount, or drug-drug combination regimen, even if asked directly or if it seems retrievable — dosing depends on labs, weight, renal/hepatic function, and other meds you don't have. Redirect to a prescriber/pharmacist every time.
+- Use hedged language for possibilities ("can be related to", "one possibility is") rather than declarative diagnosis ("you have X").
+- Never claim a diagnostic test result or number you weren't given by the user or the reference context.
+
+PERSONA & INTERACTION RULES:
+- Speak warmly and empathetically, like an approachable clinician-adjacent assistant.
+- STRICT BAN: never say "on a scale of 1 to 10" or "rate your pain".
+- Never offer a definitive diagnosis or claim to replace in-person medical evaluation.
 
 CURRENT INSTRUCTION:
 {directive}
@@ -408,6 +467,8 @@ CURRENT INSTRUCTION:
 # ============================================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "followup_used" not in st.session_state:
+    st.session_state.followup_used = False
 
 # ============================================================
 # SIDEBAR
@@ -417,6 +478,7 @@ with st.sidebar:
 
     if st.button("＋  New Consultation", use_container_width=True):
         st.session_state.messages = []
+        st.session_state.followup_used = False
         st.rerun()
 
     st.markdown('<div class="sidebar-section-title">Session History</div>', unsafe_allow_html=True)
@@ -450,7 +512,6 @@ with st.sidebar:
 # MAIN CANVAS (GREETING & QUICK START)
 # ============================================================
 if not st.session_state.messages:
-    # Accurate IST Timezone Calculation (UTC + 5:30)
     ist_now = datetime.now(timezone(timedelta(hours=5, minutes=30)))
     hour = ist_now.hour
 
@@ -490,16 +551,19 @@ if not st.session_state.messages:
 
     if quick_input:
         retrieval_query = build_retrieval_query(quick_input, [])
-        results = hybrid_search(retrieval_query, top_k=3)
+        results, top_score = hybrid_search(retrieval_query, top_k=3, return_scores=True)
         context = "\n\n".join([f"[REFERENCE CASE {i+1}]\n{c}" for i, c in enumerate(results)])
+        ask_followup = should_ask_followup(quick_input, [], top_score)
 
         st.session_state.messages.append({"role": "user", "content": quick_input})
         with st.chat_message("user", avatar="👤"):
             st.markdown(quick_input)
 
         with st.chat_message("assistant", avatar="🩺"):
-            reply = st.write_stream(stream_response(quick_input, [], nearby_hospitals, context))
+            reply = st.write_stream(stream_response(quick_input, [], nearby_hospitals, context, ask_followup))
 
+        if ask_followup:
+            st.session_state.followup_used = True
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.rerun()
 
@@ -516,15 +580,19 @@ for msg in st.session_state.messages:
 # ============================================================
 if user_text := st.chat_input("Describe how you are feeling or ask a question..."):
     retrieval_query = build_retrieval_query(user_text, st.session_state.messages)
-    results = hybrid_search(retrieval_query, top_k=3)
+    results, top_score = hybrid_search(retrieval_query, top_k=3, return_scores=True)
     context = "\n\n".join([f"[REFERENCE CASE {i+1}]\n{c}" for i, c in enumerate(results)])
+
+    history = st.session_state.messages[:]
+    ask_followup = should_ask_followup(user_text, history, top_score)
 
     st.session_state.messages.append({"role": "user", "content": user_text})
     with st.chat_message("user", avatar="👤"):
         st.markdown(user_text)
 
     with st.chat_message("assistant", avatar="🩺"):
-        history = st.session_state.messages[:-1]
-        reply = st.write_stream(stream_response(user_text, history, nearby_hospitals, context))
+        reply = st.write_stream(stream_response(user_text, history, nearby_hospitals, context, ask_followup))
 
+    if ask_followup:
+        st.session_state.followup_used = True
     st.session_state.messages.append({"role": "assistant", "content": reply})
