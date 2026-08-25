@@ -22,10 +22,6 @@ from langchain_huggingface import HuggingFaceEmbeddings
 # ============================================================
 load_dotenv()
 
-# SECURITY FIX: no hardcoded fallback keys. Fail loudly instead of
-# silently running on an embedded secret (which is what was happening
-# before — those two keys must be rotated now that they've been pasted
-# into a chat, regardless of this fix).
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY") or st.secrets.get("GROQ_API_KEY", None)
 HF_TOKEN = os.environ.get("HF_TOKEN") or st.secrets.get("HF_TOKEN", None)
 
@@ -63,12 +59,6 @@ st.markdown("""
         --accent-terracotta: #D97757;
     }
 
-    /* Force a consistent color-scheme so native browser/OS light-mode
-       rendering of form controls (textarea caret, autofill, etc.)
-       doesn't fight our overrides. This is the root cause of "white
-       text on white background" in the chat input under light mode:
-       Streamlit's own light theme was winning inside the BaseWeb
-       textarea before our color rule applied on top of it. */
     html, body {
         color-scheme: dark;
     }
@@ -176,11 +166,6 @@ st.markdown("""
         transform: translateY(-1px);
     }
 
-    /* --- CHAT INPUT: fixed for light-mode visibility ---
-       Target every layer (container, BaseWeb wrapper, and the raw
-       textarea) explicitly with background + text color together,
-       so no layer can independently fall back to a native light
-       background under a light OS/browser theme. */
     [data-testid="stChatInput"],
     [data-testid="stChatInput"] > div,
     [data-testid="stChatInput"] [data-baseweb="textarea"],
@@ -319,7 +304,7 @@ user_city, user_lat, user_lon, nearby_hospitals = get_location_and_hospitals()
 
 
 # ============================================================
-# RETRIEVAL
+# RETRIEVAL & INTENT CLASSIFICATION
 # ============================================================
 def hybrid_search(query, top_k=3, return_scores=False):
     query_vector = np.array(
@@ -342,9 +327,6 @@ def hybrid_search(query, top_k=3, return_scores=False):
     chunks = [chunk_series.iloc[idx] for idx, _ in top]
 
     if return_scores:
-        # Top RRF score is a rough proxy for "did retrieval actually find
-        # something relevant" — used below to decide whether the model
-        # should hedge instead of answering confidently.
         top_score = top[0][1] if top else 0.0
         return chunks, top_score
     return chunks
@@ -364,14 +346,34 @@ EMERGENCY_KEYWORDS = [
     "coughing blood", "unconscious", "severe chest"
 ]
 
+MEDICATION_KEYWORDS = [
+    "tablet", "tablets", "medicine", "medicines", "medication", "drug", "drugs",
+    "pill", "pills", "dose", "dosage", "otc", "over the counter", "syrup",
+    "capsule", "antibiotic", "what can i take"
+]
+
+SYMPTOM_PHRASES = [
+    "i have", "i've been", "i am feeling", "i'm feeling", "i feel",
+    "my ", "since yesterday", "since last", "for the past", "it hurts"
+]
+
 
 def is_emergency(query):
     q = query.lower()
     return any(kw in q for kw in EMERGENCY_KEYWORDS)
 
 
+def classify_query(query):
+    q = query.lower()
+    if any(kw in q for kw in MEDICATION_KEYWORDS):
+        return "medication"
+    if any(phrase in q for phrase in SYMPTOM_PHRASES):
+        return "symptom"
+    return "informational"
+
+
 # ============================================================
-# FOLLOW-UP DECISION (replaces the old keyword/word-count heuristic)
+# FOLLOW-UP DECISION
 # ============================================================
 def should_ask_followup(query, history, top_score):
     if st.session_state.get("followup_used"):
@@ -383,7 +385,7 @@ def should_ask_followup(query, history, top_score):
         return False
     word_count = len(query.split())
     is_vague = word_count <= 6
-    weak_retrieval = top_score < 0.02  # tuned loosely; adjust after logging real scores
+    weak_retrieval = top_score < 0.02
     return is_vague and weak_retrieval
 
 
@@ -407,6 +409,7 @@ def stream_response(query, history, hospitals, context, ask_followup):
         return
 
     hospital_name = f"**{hospitals[0]}**" if hospitals else "your nearest clinic"
+    query_type = classify_query(query)
 
     if ask_followup:
         directive = """The user's query is brief and retrieval did not find a strong match in the reference material.
@@ -415,30 +418,34 @@ def stream_response(query, history, hospitals, context, ask_followup):
 - Ask ONLY ONE focused, natural follow-up question that would materially improve the answer (e.g. duration, severity, associated symptoms).
 - NEVER ask to rate pain on a scale of 1 to 10.
 - This is your only chance to ask a follow-up in this conversation — do not plan to ask another one later."""
-    else:
-        directive = f"""Provide direct, clear guidance now — do not ask further questions.
-- Structure clearly:
-  1. **What might be going on**: possibilities, phrased as possibilities ("can be associated with", not "you have").
-  2. **Practical Home Care**: safe, general steps — only if genuinely low-risk self-care applies to this topic.
-  3. **When to get checked in person**: concrete red flags.
-  4. **Next Steps**: a reminder to see {hospital_name} or a doctor if it worsens or persists.
-- If the reference context below does not actually address this question, say so plainly
-  ("I don't have solid reference material on this specific point") instead of filling the gap
-  from general knowledge presented with the same confidence as sourced content."""
+
+    elif query_type == "medication":
+        directive = """The user is asking specifically about tablets, medicines, or over-the-counter options.
+- Give a SHORT, DIRECT response (3-4 sentences max).
+- DO NOT force the 4-part triage template (do NOT write "1. What might be going on", "2. Practical Home Care", etc.).
+- Clearly name standard Over-The-Counter (OTC) generic classes commonly used in India (e.g., Paracetamol for aches/fever, Cetirizine or Chlorpheniramine for runny nose/allergies, saline nasal sprays for congestion).
+- Remind them in 1 sentence to confirm with a pharmacist or physician before taking any medication."""
+
+    elif query_type == "informational":
+        directive = """This is a general factual question, not a description of the user's own current symptoms.
+- Answer directly and concisely in prose — do NOT force the 4-part triage template.
+- If the reference context below does not address this question, state what is known concisely without rambling."""
+
+    else:  # symptom
+        directive = f"""The user is describing how they are feeling right now. Provide structured triage guidance:
+1. **What might be going on**: possibilities, phrased as possibilities ("can be associated with", not "you have").
+2. **Practical Home Care**: safe, low-risk self-care steps.
+3. **When to get checked in person**: concrete red-flag symptoms.
+4. **Next Steps**: a reminder to consult {hospital_name} or a doctor if symptoms worsen."""
 
     system_message = f"""You are AarogyaAI, a friendly, compassionate medical-information assistant — not a diagnosing physician.
 
 GROUNDING RULES (accuracy-critical, follow strictly):
-- Base factual medical claims on the Reference Context provided below whenever it's relevant. Treat it as your primary source.
-- If the Reference Context does not cover the specific question (e.g. exact dosing, drug combinations, lab thresholds), do NOT invent numbers or specifics from general training knowledge and present them with the same confidence as sourced fact. Say plainly that this needs a clinician/pharmacist, and stop there.
-- NEVER state a specific drug dosage, mg amount, or drug-drug combination regimen, even if asked directly or if it seems retrievable — dosing depends on labs, weight, renal/hepatic function, and other meds you don't have. Redirect to a prescriber/pharmacist every time.
+- Base factual medical claims on the Reference Context provided below whenever it's relevant.
+- NEVER state a specific drug dosage, exact mg amount, or prescription-only medication regimens. Focus on standard OTC categories where appropriate.
 - Use hedged language for possibilities ("can be related to", "one possibility is") rather than declarative diagnosis ("you have X").
-- Never claim a diagnostic test result or number you weren't given by the user or the reference context.
-
-PERSONA & INTERACTION RULES:
-- Speak warmly and empathetically, like an approachable clinician-adjacent assistant.
+- Speak warmly, clearly, and directly without unnecessary filler.
 - STRICT BAN: never say "on a scale of 1 to 10" or "rate your pain".
-- Never offer a definitive diagnosis or claim to replace in-person medical evaluation.
 
 CURRENT INSTRUCTION:
 {directive}
